@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 
@@ -20,6 +21,7 @@
 #include "Project.hpp"
 #include "Utility.hpp"
 #include "node/Property.hpp"
+#include "preprocessors/TemplatePreprocessor.hpp"
 #include "sdl_trigger.h"
 
 struct ModuleScanResult {
@@ -128,6 +130,9 @@ private:
 
     Config m_cfg{};
     std::optional<std::chrono::system_clock::time_point> m_cfg_save_time{};
+    std::optional<preprocessor::PreprocessResult> m_template_processing{};
+    
+    preprocessor::TemplatePreprocessor m_template_preprocessor{};
 
     std::recursive_mutex m_lua_lock{};
     std::unique_ptr<sol::state> m_lua{};
@@ -176,4 +181,6 @@ private:
     void remember_type_and_address();
 
     void set_window_title();
+    void cleanup_template_processing();
 };
+

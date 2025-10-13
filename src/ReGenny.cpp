@@ -55,6 +55,7 @@ ReGenny::ReGenny(SDL_Window* window)
 }
 
 ReGenny::~ReGenny() {
+    cleanup_template_processing();
 }
 
 void ReGenny::process_event(SDL_Event& e) {
@@ -527,20 +528,50 @@ void ReGenny::file_reload() {
         return;
     }
 
-    for (auto&& filepath : m_sdk->imports()) {
-        auto cwt = std::filesystem::last_write_time(filepath);
+    auto check_and_reload = [&](const std::filesystem::path& path) -> bool {
+        std::error_code ec{};
+        auto cwt = std::filesystem::last_write_time(path, ec);
 
-        try {
-            if (cwt > m_file_lwt) {
-                spdlog::info("Reopening {}...", filepath.string());
-                parse_file();
-                m_file_lwt = cwt;
-                return;
+        if (ec) {
+            spdlog::error("Failed to get last write time for {}: {}", path.string(), ec.message());
+            return false;
+        }
+
+        if (cwt > m_file_lwt) {
+            spdlog::info("Reopening {}...", path.string());
+            parse_file();
+            m_file_lwt = cwt;
+            return true;
+        }
+
+        return false;
+    };
+
+    if (check_and_reload(m_open_filepath)) {
+        return;
+    }
+
+    for (auto&& filepath : m_sdk->imports()) {
+        std::filesystem::path path_to_check = filepath;
+
+        if (m_template_processing) {
+            auto lookup = m_template_processing->m_processed_to_original.find(filepath);
+
+            if (lookup == m_template_processing->m_processed_to_original.end()) {
+                lookup = m_template_processing->m_processed_to_original.find(filepath.lexically_normal());
             }
-        } catch (const std::exception& e) {
-            spdlog::error("Failed to get last write time for {}: {}", filepath.string(), e.what());
-        } catch (...) {
-            spdlog::error("Failed to get last write time for {} (Unknown reason)", filepath.string());
+
+            if (lookup != m_template_processing->m_processed_to_original.end()) {
+                path_to_check = lookup->second;
+            }
+        }
+
+        if (!std::filesystem::exists(path_to_check)) {
+            continue;
+        }
+
+        if (check_and_reload(path_to_check)) {
+            return;
         }
     }
 }
@@ -1693,24 +1724,76 @@ void ReGenny::reset_lua_state() {
 }
 
 void ReGenny::parse_file() try {
+    cleanup_template_processing();
+
+    std::optional<preprocessor::PreprocessResult> template_result{};
+    struct TemplateCleanupGuard {
+        std::optional<preprocessor::PreprocessResult>* result{};
+        preprocessor::IPreprocessor* preprocessor{};
+        bool keep{false};
+
+        ~TemplateCleanupGuard() {
+            if (!keep && result != nullptr && result->has_value() && preprocessor != nullptr) {
+                preprocessor->cleanup(result->value());
+            }
+        }
+    } 
+    
+    cleanup_guard{&template_result, &m_template_preprocessor, false};
+    auto parse_path = m_open_filepath;
+
+    if (auto processed = m_template_preprocessor.process_tree(m_open_filepath); processed) {
+        template_result = std::move(processed);
+        parse_path = template_result->m_processed_root;
+    }
+
+    m_file_lwt = {};
+
     auto sdk = std::make_unique<sdkgenny::Sdk>();
 
-    sdk->import(m_open_filepath);
+    sdk->import(parse_path);
 
     sdkgenny::parser::State s{};
-    s.filepath = m_open_filepath;
+    s.filepath = parse_path;
     s.parents.push_back(sdk->global_ns());
 
-    tao::pegtl::file_input in{m_open_filepath};
+    tao::pegtl::file_input in{parse_path};
 
     if (tao::pegtl::parse<sdkgenny::parser::Grammar, sdkgenny::parser::Action>(in, s)) {
         // We just parsed, so record the max last write time for any of the imported files.
         // This prevents reloading on opening a file for the first time since launch.
+        auto record_last_write_time = [this](const std::filesystem::path& path) {
+            std::error_code ec{};
+            auto lwt = std::filesystem::last_write_time(path, ec);
+
+            if (!ec) {
+                m_file_lwt = std::max(m_file_lwt, lwt);
+            }
+        };
+
+        record_last_write_time(m_open_filepath);
+
         for (auto&& import : sdk->imports()) {
-            m_file_lwt = std::max(m_file_lwt, std::filesystem::last_write_time(import));
+            std::filesystem::path original_path = import;
+
+            if (template_result) {
+                auto lookup = template_result->m_processed_to_original.find(import);
+
+                if (lookup == template_result->m_processed_to_original.end()) {
+                    lookup = template_result->m_processed_to_original.find(import.lexically_normal());
+                }
+
+                if (lookup != template_result->m_processed_to_original.end()) {
+                    original_path = lookup->second;
+                }
+            }
+
+            record_last_write_time(original_path);
         }
 
         m_sdk = std::move(sdk);
+        m_template_processing = std::move(template_result);
+        cleanup_guard.keep = m_template_processing.has_value();
 
         if (m_mem_ui != nullptr) {
             m_project.props[m_project.type_chosen] = m_mem_ui->props();
@@ -1832,3 +1915,13 @@ void ReGenny::set_window_title() {
 
     SDL_SetWindowTitle(m_window, title.c_str());
 }
+
+void ReGenny::cleanup_template_processing() {
+    if (!m_template_processing) {
+        return;
+    }
+
+    m_template_preprocessor.cleanup(*m_template_processing);
+    m_template_processing.reset();
+}
+
