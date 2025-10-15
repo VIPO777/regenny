@@ -1366,6 +1366,163 @@ const TemplateDefinition::Specialization& register_specialization(
     return def.m_specializations.back();
 }
 
+size_t find_structural_closing(const std::string& text, size_t open_pos) {
+
+    size_t depth = 1;
+    size_t pos = open_pos + 1;
+
+    while (pos < text.size() && depth > 0) {
+        auto ch = text[pos];
+
+        if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+        } else if (ch == '"') {
+            skip_string_literal(text, pos, '"');
+            continue;
+        } else if (ch == '\'') {
+            skip_string_literal(text, pos, '\'');
+            continue;
+        } else if (ch == '/' && pos + 1 < text.size()) {
+            if (text[pos + 1] == '/') {
+                while (pos < text.size() && text[pos] != '\n') {
+                    ++pos;
+                }
+                continue;
+            }
+
+            if (text[pos + 1] == '*') {
+                pos += 2;
+
+                while (pos + 1 < text.size() && !(text[pos] == '*' && text[pos + 1] == '/')) {
+                    ++pos;
+                }
+
+                pos = std::min(pos + 2, text.size());
+                continue;
+            }
+        }
+
+        ++pos;
+    }
+
+    return depth == 0 ? pos : std::string::npos;
+}
+
+std::string qualify_enum_usages(const std::string& body, const std::string& enum_name,
+    const std::string& qualified_name) {
+
+    std::string result = body;
+    size_t search_pos = 0;
+
+    while (search_pos < result.size()) {
+        auto match = find_identifier(result, enum_name, search_pos);
+
+        if (match == std::string::npos) {
+            break;
+        }
+
+        result.replace(match, enum_name.size(), qualified_name);
+        search_pos = match + qualified_name.size();
+    }
+
+    return result;
+}
+
+std::string process_specialization_body_enums(
+    const TemplateDefinition& def, const TemplateDefinition::Specialization& spec) {
+
+    std::string result = spec.m_body;
+    size_t search_pos = 0;
+
+    while (search_pos < result.size()) {
+        auto enum_pos = result.find("enum", search_pos);
+
+        if (enum_pos == std::string::npos) {
+            break;
+        }
+
+        if (enum_pos > 0 && is_identifier_char(result[enum_pos - 1])) {
+            search_pos = enum_pos + 4;
+            continue;
+        }
+
+        size_t name_pos = enum_pos + 4;
+
+        while (name_pos < result.size() && std::isspace(static_cast<unsigned char>(result[name_pos]))) {
+            ++name_pos;
+        }
+
+        if (name_pos >= result.size()) {
+            break;
+        }
+
+        if (result.compare(name_pos, 5, "class") == 0 && result.size() > name_pos + 5 &&
+            !is_identifier_char(result[name_pos + 5])) {
+            search_pos = name_pos + 5;
+            continue;
+        }
+
+        size_t name_end = name_pos;
+
+        while (name_end < result.size() && is_identifier_char(result[name_end])) {
+            ++name_end;
+        }
+
+        if (name_end == name_pos) {
+            search_pos = enum_pos + 4;
+            continue;
+        }
+
+        auto enum_name = result.substr(name_pos, name_end - name_pos);
+
+        size_t brace_pos = result.find('{', name_end);
+
+        if (brace_pos == std::string::npos) {
+            break;
+        }
+
+        auto closing_pos = find_structural_closing(result, brace_pos);
+
+        if (closing_pos == std::string::npos) {
+            break;
+        }
+
+        ++closing_pos;
+
+        while (closing_pos < result.size() &&
+            std::isspace(static_cast<unsigned char>(result[closing_pos]))) {
+            ++closing_pos;
+        }
+
+        if (closing_pos < result.size() && result[closing_pos] == ';') {
+            ++closing_pos;
+        }
+
+        size_t erase_end = closing_pos;
+
+        while (erase_end < result.size() &&
+            (result[erase_end] == '\r' || result[erase_end] == '\n')) {
+            ++erase_end;
+        }
+
+        result.erase(enum_pos, erase_end - enum_pos);
+
+        auto qualified = def.full_name();
+
+        if (!qualified.empty()) {
+            qualified += '.';
+        }
+
+        qualified += enum_name;
+        result = qualify_enum_usages(result, enum_name, qualified);
+        search_pos = enum_pos;
+    }
+
+    return result;
+}
+
 std::vector<std::filesystem::path> extract_imports(const std::string& text, const std::filesystem::path& file_path) {
     std::vector<std::filesystem::path> imports{};
     auto size = text.size();
@@ -1691,7 +1848,9 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
                             output += specialization.m_sanitized_name;
                             output += specialization.m_between;
                             output.push_back('{');
-                            output += specialization.m_body;
+
+                            auto processed_body = process_specialization_body_enums(*def, specialization);
+                            output += processed_body;
 
                             auto first_non_space = std::find_if_not(specialization.m_closing.begin(),
                                 specialization.m_closing.end(), [](unsigned char ch) { return std::isspace(ch); });
