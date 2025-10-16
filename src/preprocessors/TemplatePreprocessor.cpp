@@ -46,6 +46,7 @@ struct TemplateDefinition {
     std::string m_closing{};
     std::string m_indentation{};
     std::string m_scope_path{};
+    std::unordered_set<std::string> m_local_types{};
     size_t m_start{};
     size_t m_end{};
     bool m_placeholder_generated{false};
@@ -80,6 +81,8 @@ struct FileProcessResult {
     bool m_had_templates{};
     std::vector<std::filesystem::path> m_imports{};
 };
+
+void collect_local_type_names(TemplateDefinition& def);
 
 bool is_identifier_start(char c) {
     return std::isalpha(static_cast<unsigned char>(c)) || c == '_';
@@ -568,6 +571,7 @@ bool parse_template_definition(const std::string& text, size_t pos, TemplateDefi
 
     out.m_indentation = text.substr(indentation_pos, pos - indentation_pos);
     out.m_body = text.substr(body_start, body_end - body_start);
+    collect_local_type_names(out);
     out.m_closing = text.substr(body_end, closing_start - body_end);
     out.m_start = pos;
     out.m_end = closing_start;
@@ -1235,6 +1239,73 @@ std::string generate_placeholder_definition(const TemplateDefinition& def) {
     return oss.str();
 }
 
+void collect_local_type_names(TemplateDefinition& def) {
+    const auto& body = def.m_body;
+    size_t pos = 0;
+
+    auto is_keyword_boundary = [&](size_t start, size_t len) -> bool {
+        bool left_ok = start == 0 || !is_identifier_char(body[start - 1]);
+        bool right_ok = start + len >= body.size() || !is_identifier_char(body[start + len]);
+        return left_ok && right_ok;
+    };
+
+    auto extract_name = [&](size_t& cursor) -> std::optional<std::string> {
+        skip_whitespace_and_comments(body, cursor);
+
+        if (cursor >= body.size() || !is_identifier_start(body[cursor])) {
+            return std::nullopt;
+        }
+
+        size_t name_end = cursor;
+
+        while (name_end < body.size() && is_identifier_char(body[name_end])) {
+            ++name_end;
+        }
+
+        auto name = body.substr(cursor, name_end - cursor);
+        cursor = name_end;
+        return name;
+    };
+
+    while (pos < body.size()) {
+        if (body.compare(pos, 6, "struct") == 0 && is_keyword_boundary(pos, 6)) {
+            pos += 6;
+            auto maybe_name = extract_name(pos);
+            if (maybe_name.has_value()) {
+                def.m_local_types.insert(*maybe_name);
+            }
+            continue;
+        }
+
+        if (body.compare(pos, 5, "class") == 0 && is_keyword_boundary(pos, 5)) {
+            pos += 5;
+            auto maybe_name = extract_name(pos);
+            if (maybe_name.has_value()) {
+                def.m_local_types.insert(*maybe_name);
+            }
+            continue;
+        }
+
+        if (body.compare(pos, 4, "enum") == 0 && is_keyword_boundary(pos, 4)) {
+            pos += 4;
+            skip_whitespace_and_comments(body, pos);
+
+            if (body.compare(pos, 5, "class") == 0 && is_keyword_boundary(pos, 5)) {
+                pos += 5;
+                skip_whitespace_and_comments(body, pos);
+            }
+
+            auto maybe_name = extract_name(pos);
+            if (maybe_name.has_value()) {
+                def.m_local_types.insert(*maybe_name);
+            }
+            continue;
+        }
+
+        ++pos;
+    }
+}
+
 struct DefinitionLookup {
     std::unordered_map<std::string, TemplateDefinition*> m_by_full{};
     std::unordered_map<std::string, std::vector<TemplateDefinition*>> m_by_name{};
@@ -1521,6 +1592,77 @@ std::string process_specialization_body_enums(
     }
 
     return result;
+}
+
+std::string qualify_scope_types(
+    const TemplateDefinition& def, const TemplateDefinition::Specialization& spec, std::string body) {
+    if (def.m_scope_path.empty()) {
+        return body;
+    }
+
+    const std::string prefix = def.m_scope_path + ".";
+    const std::unordered_set<std::string> keywords{
+        "struct", "class", "enum", "union", "typedef", "using", "return", "constexpr",
+        "const", "volatile", "template", "typename", "static", "mutable"};
+
+    std::unordered_set<std::string> skip = def.m_local_types;
+
+    for (const auto& param : def.m_parameters) {
+        skip.insert(param.m_name);
+    }
+
+    for (const auto& arg : spec.m_arguments) {
+        skip.insert(arg);
+    }
+
+    size_t pos = 0;
+
+    while (pos < body.size()) {
+        while (pos < body.size() && !is_identifier_start(body[pos])) {
+            ++pos;
+        }
+
+        if (pos >= body.size()) {
+            break;
+        }
+
+        size_t end = pos + 1;
+
+        while (end < body.size() && is_identifier_char(body[end])) {
+            ++end;
+        }
+
+        auto token = body.substr(pos, end - pos);
+
+        if (keywords.contains(token) || skip.contains(token)) {
+            pos = end;
+            continue;
+        }
+
+        if (!token.empty() && std::islower(static_cast<unsigned char>(token.front()))) {
+            pos = end;
+            continue;
+        }
+
+        bool already_qualified = false;
+
+        if (pos > 0) {
+            if (body[pos - 1] == '.' || body[pos - 1] == ':') {
+                already_qualified = true;
+            } else if (pos > 1 && body[pos - 2] == ':' && body[pos - 1] == ':') {
+                already_qualified = true;
+            }
+        }
+
+        if (!already_qualified) {
+            body.replace(pos, token.size(), prefix + token);
+            pos += prefix.size() + token.size();
+        } else {
+            pos = end;
+        }
+    }
+
+    return body;
 }
 
 std::vector<std::filesystem::path> extract_imports(const std::string& text, const std::filesystem::path& file_path) {
@@ -1850,6 +1992,7 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
                             output.push_back('{');
 
                             auto processed_body = process_specialization_body_enums(*def, specialization);
+                            processed_body = qualify_scope_types(*def, specialization, std::move(processed_body));
                             output += processed_body;
 
                             auto first_non_space = std::find_if_not(specialization.m_closing.begin(),
