@@ -47,6 +47,7 @@ struct TemplateDefinition {
     std::string m_indentation{};
     std::string m_scope_path{};
     std::unordered_set<std::string> m_local_types{};
+    std::unordered_set<std::string> m_local_enums{};
     size_t m_start{};
     size_t m_end{};
     bool m_placeholder_generated{false};
@@ -1298,6 +1299,7 @@ void collect_local_type_names(TemplateDefinition& def) {
             auto maybe_name = extract_name(pos);
             if (maybe_name.has_value()) {
                 def.m_local_types.insert(*maybe_name);
+                def.m_local_enums.insert(*maybe_name);
             }
             continue;
         }
@@ -1665,6 +1667,53 @@ std::string qualify_scope_types(
     return body;
 }
 
+std::string build_specialization_definition(
+    const TemplateDefinition& def, const TemplateDefinition::Specialization& spec, std::string_view indent) {
+    std::string definition;
+
+    if (!indent.empty()) {
+        definition.append(indent);
+    }
+
+    definition += def.m_keyword;
+    definition.push_back(' ');
+    definition += spec.m_sanitized_name;
+    definition += spec.m_between;
+    definition.push_back('{');
+
+    auto processed_body = process_specialization_body_enums(def, spec);
+    processed_body = qualify_scope_types(def, spec, std::move(processed_body));
+    definition += processed_body;
+
+    auto first_non_space = std::find_if_not(
+        spec.m_closing.begin(), spec.m_closing.end(), [](unsigned char ch) { return std::isspace(ch); });
+
+    if (first_non_space == spec.m_closing.end() || *first_non_space != '}') {
+        definition.push_back('}');
+    }
+
+    definition += spec.m_closing;
+
+    auto scoped_prefix = def.m_scope_path;
+
+    for (const auto& enum_name : def.m_local_enums) {
+        std::string short_name = scoped_prefix.empty() ? enum_name : scoped_prefix + "." + enum_name;
+        std::string full_name = def.full_name().empty() ? enum_name : def.full_name() + "." + enum_name;
+
+        size_t pos = 0;
+        while ((pos = definition.find(short_name, pos)) != std::string::npos) {
+            definition.replace(pos, short_name.size(), full_name);
+            pos += full_name.size();
+        }
+    }
+
+    if (definition.empty() || definition.back() != '\n') {
+        definition.push_back('\n');
+    }
+
+    return definition;
+}
+
 std::vector<std::filesystem::path> extract_imports(const std::string& text, const std::filesystem::path& file_path) {
     std::vector<std::filesystem::path> imports{};
     auto size = text.size();
@@ -1817,6 +1866,8 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
     size_t pos = 0;
     size_t brace_depth = 0;
     std::vector<ScopeFrame> scope_stack{{"", "", 0, {}}};
+    std::vector<size_t> struct_start_positions{};
+    bool in_base_list = false;
     PendingScope pending_scope{};
 
     while (pos < text.size()) {
@@ -1893,6 +1944,7 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
             output.push_back('{');
             ++pos;
             ++brace_depth;
+            in_base_list = false;
 
             if (pending_scope.m_expect_brace) {
                 auto new_path = scope_stack.back().m_path;
@@ -1906,6 +1958,9 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
 
                 scope_stack.push_back(ScopeFrame{pending_scope.m_name, new_path, brace_depth, {}});
                 pending_scope = {};
+                if (!struct_start_positions.empty()) {
+                    struct_start_positions.pop_back();
+                }
             }
 
             continue;
@@ -1931,11 +1986,22 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
             output.push_back(';');
             ++pos;
             pending_scope = {};
+            in_base_list = false;
+            if (!struct_start_positions.empty()) {
+                struct_start_positions.pop_back();
+            }
             continue;
         }
 
         if (std::isspace(static_cast<unsigned char>(c))) {
             output.push_back(c);
+            ++pos;
+            continue;
+        }
+
+        if (c == ':' && !(pos + 1 < text.size() && text[pos + 1] == ':') && pending_scope.m_expect_brace) {
+            in_base_list = true;
+            output.push_back(':');
             ++pos;
             continue;
         }
@@ -1955,7 +2021,16 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
                 pending_scope.m_expect_brace = true;
             }
 
-            if (token == "namespace" || token == "struct" || token == "class") {
+            if (token == "namespace") {
+                pending_scope = {};
+                pending_scope.m_keyword = token;
+                pending_scope.m_expect_name = true;
+                output.append(token);
+                continue;
+            }
+
+            if (token == "struct" || token == "class") {
+                struct_start_positions.push_back(output.size());
                 pending_scope = {};
                 pending_scope.m_keyword = token;
                 pending_scope.m_expect_name = true;
@@ -1979,39 +2054,35 @@ FileProcessResult process_file_content(const std::filesystem::path& file_path, c
                         const auto& specialization = register_specialization(*def, args, token_prefix, scope_stack.back().m_path);
                         auto& scope = scope_stack.back();
 
-                        if (scope.m_emitted_specializations.insert(specialization.m_sanitized_name).second) {
+                        auto line_indent = current_indent(output);
+                        bool emitted_definition = scope.m_emitted_specializations.insert(specialization.m_sanitized_name).second;
+
+                        if (emitted_definition) {
                             auto indent = current_indent(output);
-                            if (!output.empty() && output.back() != '\n') {
-                                output.push_back('\n');
+                            auto definition = build_specialization_definition(*def, specialization, indent);
+
+                            if (in_base_list && !struct_start_positions.empty()) {
+                                auto insert_pos = struct_start_positions.back();
+
+                                if (insert_pos > 0 && output[insert_pos - 1] != '\n') {
+                                    definition.insert(definition.begin(), '\n');
+                                }
+
+                                output.insert(insert_pos, definition);
+                            } else {
+                                if (!output.empty() && output.back() != '\n') {
+                                    output.push_back('\n');
+                                }
+                                output += definition;
                             }
-                            output += indent;
-                            output += def->m_keyword;
-                            output.push_back(' ');
-                            output += specialization.m_sanitized_name;
-                            output += specialization.m_between;
-                            output.push_back('{');
+                        }
 
-                            auto processed_body = process_specialization_body_enums(*def, specialization);
-                            processed_body = qualify_scope_types(*def, specialization, std::move(processed_body));
-                            output += processed_body;
-
-                            auto first_non_space = std::find_if_not(specialization.m_closing.begin(),
-                                specialization.m_closing.end(), [](unsigned char ch) { return std::isspace(ch); });
-
-                            if (first_non_space == specialization.m_closing.end() || *first_non_space != '}') {
-                                output.push_back('}');
-                            }
-
-                            output += specialization.m_closing;
-
-                            if (output.empty() || output.back() != '\n') {
-                                output.push_back('\n');
-                            }
-
-                            output += indent;
+                        if (emitted_definition && !in_base_list) {
+                            output += line_indent;
                         }
 
                         output += specialization.m_sanitized_name;
+
                         pos = args_end;
                         result.m_had_templates = true;
                         pending_scope = {};
@@ -2139,10 +2210,3 @@ void TemplatePreprocessor::cleanup(const PreprocessResult& result) {
 }
 
 } // namespace preprocessor
-
-
-
-
-
-
-
